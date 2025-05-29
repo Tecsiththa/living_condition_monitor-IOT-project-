@@ -1,0 +1,520 @@
+/**
+ * ESP8266 Environmental Monitoring System with WiFi Scanner
+ * Monitors sensors and sends data to Firebase
+ * Includes WiFi scanning for network selection
+ */
+
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <DHT.h>
+#include <MQ135.h>
+#include <arduinoFFT.h>
+#include <ArduinoJson.h> // Ensure you have ArduinoJson library installed (e.g., v6)
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <time.h>
+
+// Define pins
+#define DHT_PIN 2           // DHT22 data pin (GPIO2 corresponds to NodeMCU D4)
+#define MQ135_PIN A0        // MQ-135 analog output (NodeMCU A0/ADC0)
+#define SOUND_PIN 14        // Sound sensor digital pin (GPIO14 corresponds to NodeMCU D5)
+
+// WiFi credentials (THESE ARE NOW HARDCODED FOR AUTOMATIC CONNECTION)
+// ENSURE THESE ARE CORRECT FOR YOUR HOTSPOT!
+String WIFI_SSID = "HUAWEI Y9 Prime 2019";
+String WIFI_PASSWORD = "sarath123";
+
+// Firebase objects
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData firebaseData;
+FirebaseJson json; // Re-initializing json object each time it's used
+
+// Sensor objects
+DHT dht(DHT_PIN, DHT22); // Ensure DHT22 is the correct sensor type (or change to DHT11)
+MQ135 gasSensor(MQ135_PIN);
+
+// FFT setup for Sound Sensor (using digital read)
+#define SAMPLES 128 // Must be a power of 2
+#define SAMPLING_FREQUENCY 10000.0f // Hz
+unsigned int sampling_period_us;
+float vReal[SAMPLES];
+float vImag[SAMPLES];
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+
+// NTP setup
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
+
+// Sensing intervals
+unsigned long previousSensorReadMillis = 0;
+const long sensorReadInterval = 10000; // Read sensors every 10 seconds
+unsigned long previousUploadMillis = 0;
+const long uploadInterval = 60000; // Upload data to Firebase every 60 seconds
+
+// Global data storage (will be updated by readSensors())
+float temperature = 0.0;
+float humidity = 0.0;
+float airQuality = 0.0; // Raw analog read value
+float soundLevel = 0.0;
+float correctedPPM = 0.0; // Corrected air quality in PPM
+
+// Variables to track sensor reading success
+bool dhtReadSuccess = false;
+bool mq135ReadSuccess = false;
+bool soundReadSuccess = false;
+
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(SOUND_PIN, INPUT); // Sound sensor digital pin
+  
+  // Initialize sensors
+  dht.begin();
+  
+  // Calculate sampling period for FFT
+  sampling_period_us = round(1000000.0 * (1.0 / SAMPLING_FREQUENCY));
+  
+  // --- OLD WIFI CONNECTION METHOD ---
+  // No WiFi scanning or waiting for credentials here.
+  // It will directly try to connect using the hardcoded WIFI_SSID and WIFI_PASSWORD.
+  connectToWiFi();
+  // --- END OLD WIFI CONNECTION METHOD ---
+
+  // Configure Firebase
+  // !!! REPLACE WITH YOUR ACTUAL FIREBASE HOST AND LEGACY TOKEN !!!
+  config.host = "https://living-condition-monitoring-default-rtdb.asia-southeast1.firebasedatabase.app";
+  config.signer.tokens.legacy_token = "k5canDYzj922NTqV2d8b9NzVdDZjalrj9IoEQ4em"; 
+  
+  // Initialize Firebase SDK
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true); // Automatically reconnect to WiFi if disconnected
+  
+  Firebase.setReadTimeout(firebaseData, 1000 * 60); // Set read timeout to 60 seconds
+  Firebase.setwriteSizeLimit(firebaseData, "tiny"); // Set write size limit for smaller data
+
+  // Initialize NTP client for time synchronization
+  timeClient.begin();
+  timeClient.setTimeOffset(0); // Set time offset (0 for UTC, adjust as needed for your timezone)
+  
+  Serial.println("System Initialized. Starting sensor readings...");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Read sensors at the defined interval
+  if (currentMillis - previousSensorReadMillis >= sensorReadInterval) {
+    previousSensorReadMillis = currentMillis;
+    readSensors();
+  }
+  
+  // Upload data to Firebase at the defined interval
+  if (currentMillis - previousUploadMillis >= uploadInterval) {
+    previousUploadMillis = currentMillis;
+    
+    // Only attempt upload if at least one sensor provided valid data
+    if(dhtReadSuccess || mq135ReadSuccess || soundReadSuccess) {
+      uploadData();
+    } else {
+      Serial.println("Skipping Firebase upload: No valid sensor data yet.");
+    }
+  }
+}
+
+// Scans for available WiFi networks and prints them to Serial Monitor
+// This function is now defined but NOT CALLED in setup().
+// It is kept in case you want to easily re-enable it later.
+void scanWiFiNetworks() {
+  Serial.println("\nScanning for WiFi networks...");
+  
+  int n = WiFi.scanNetworks(); // Returns the number of networks found
+  
+  if (n == 0) {
+    Serial.println("No networks found. Ensure your mobile hotspot is enabled.");
+  } else {
+    Serial.print(n);
+    Serial.println(" networks found:");
+    
+    for (int i = 0; i < n; ++i) {
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i)); // Network SSID (name)
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i)); // Signal strength
+      Serial.print(" dBm) ");
+      Serial.println((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "Open" : "Encrypted"); // Encryption type
+      delay(10); // Small delay to allow Serial to catch up
+    }
+  }
+  
+  Serial.println("\nWiFi scan completed. Find your mobile hotspot in the list.");
+  Serial.println("Enter network number (1-" + String(n) + ") followed by 'p' and password in Serial Monitor");
+  Serial.println("Example: '3pMyPassword123' for network #3 with password 'MyPassword123'");
+}
+
+// Waits for user input via Serial Monitor to set WiFi credentials
+// This function is now defined but NOT CALLED in setup().
+// It is kept in case you want to easily re-enable it later.
+void waitForWiFiCredentials() {
+  Serial.println("Waiting for WiFi credentials...");
+  
+  while (WIFI_SSID == "HUAWEI Y9 Prime 2019" || WIFI_SSID.length() == 0) { 
+    if (Serial.available() > 0) {
+      String input = Serial.readStringUntil('\n'); // Read the whole line
+      input.trim(); // Remove leading/trailing whitespace
+      
+      int pIndex = input.indexOf('p'); // Find the 'p' separator
+      if (pIndex > 0) {
+        int networkNumber = input.substring(0, pIndex).toInt(); // Parse network number
+        WIFI_PASSWORD = input.substring(pIndex + 1); // Get password
+        
+        if (networkNumber > 0 && networkNumber <= WiFi.scanNetworks()) {
+          WIFI_SSID = WiFi.SSID(networkNumber - 1); // Get SSID from scan results
+          Serial.print("Selected network: ");
+          Serial.println(WIFI_SSID);
+        } else {
+          Serial.println("Invalid network number. Try again.");
+          WIFI_SSID = ""; // Reset to ensure loop continues
+        }
+      } else {
+        Serial.println("Invalid format. Use 'network_number' + 'p' + 'password'");
+        Serial.println("Example: '3pMyPassword123'");
+        WIFI_SSID = ""; // Reset to ensure loop continues
+      }
+    }
+    delay(100);
+  }
+}
+
+// Connects to the selected WiFi network
+void connectToWiFi() {
+  Serial.print("Connecting to ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Start WiFi connection
+  
+  Serial.print("Connecting to WiFi");
+  int connectionAttempts = 0;
+  // Wait for connection with a timeout
+  while (WiFi.status() != WL_CONNECTED && connectionAttempts < 30) {
+    Serial.print(".");
+    delay(1000);
+    connectionAttempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected to WiFi with IP: ");
+    Serial.println(WiFi.localIP()); // Print assigned IP address
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi. Restarting...");
+    ESP.restart(); // Restart the ESP8266 if connection fails
+  }
+}
+
+// Reads data from all connected sensors
+void readSensors() {
+  Serial.println("\n--- Reading Sensors ---");
+
+  // Reset success flags
+  dhtReadSuccess = false;
+  mq135ReadSuccess = false;
+  soundReadSuccess = false;
+  
+  // --- DHT22 Sensor ---
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  
+  if (isnan(h) || isnan(t)) {
+    Serial.println("Failed to read from DHT sensor! Check wiring and pull-up resistor.");
+    // Global temperature and humidity retain previous values or default (0.0)
+  } else {
+    temperature = t;
+    humidity = h;
+    dhtReadSuccess = true;
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+    Serial.print("Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+  }
+  
+  // --- MQ-135 Gas Sensor ---
+  // Note: MQ-135 needs a long warm-up (24-48 hours) for stable R0.
+  // Readings before then will be indicative but not precisely calibrated.
+  // Ensure MQ-135 is powered by 5V (NodeMCU Vin pin) for proper heater operation.
+  int rawAirQuality = analogRead(MQ135_PIN); // Read raw analog value
+  if (rawAirQuality >= 0 && rawAirQuality <= 1023) { // Analog read is typically 0-1023
+    airQuality = (float)rawAirQuality; // Store raw value
+    // Get corrected PPM value. If DHT reading failed, correctedPPM might be unreliable.
+    if (dhtReadSuccess) { // Only calculate correctedPPM if DHT data is valid
+        correctedPPM = gasSensor.getCorrectedPPM(temperature, humidity); 
+    } else {
+        Serial.println("Warning: DHT reading failed. Corrected PPM will not be calculated. Using raw.");
+        correctedPPM = 0.0; // Or a specific error value if you prefer
+    }
+    mq135ReadSuccess = true;
+    Serial.print("Air Quality (Raw): ");
+    Serial.println(airQuality);
+    Serial.print("Air Quality (PPM): ");
+    Serial.println(correctedPPM);
+  } else {
+    Serial.println("Failed to read from MQ-135 sensor! Check wiring and power (should be 5V).");
+    // Global airQuality and correctedPPM retain previous values or default (0.0)
+  }
+  
+  // --- Sound Sensor ---
+  // Your current sound sensor reading uses digitalRead on SOUND_PIN (D5)
+  // The FFT analysis might be more suited for an analog input (A0),
+  // but A0 is already used by MQ-135.
+  float currentSoundLevel = analyzeSoundLevel();
+  if (!isnan(currentSoundLevel) && currentSoundLevel >= 0) { // Simple validation
+     soundLevel = currentSoundLevel;
+     soundReadSuccess = true;
+     Serial.print("Sound Level: ");
+     Serial.println(soundLevel);
+  } else {
+     Serial.println("Failed to analyze sound level!");
+     // Global soundLevel retains previous value or default (0.0)
+  }
+
+  Serial.println("--- Sensor Readings Complete ---");
+}
+
+// Analyzes sound level using FFT (for digital input)
+float analyzeSoundLevel() {
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long microseconds = micros();
+    
+    // Read digital state of sound sensor
+    vReal[i] = digitalRead(SOUND_PIN); // Will be 0.0 or 1.0
+    vImag[i] = 0.0; // No imaginary part for real-valued samples
+    
+    // Wait for the sampling period
+    while (micros() < (microseconds + sampling_period_us)) {
+      // Loop does nothing but wait
+    }
+  }
+  
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES); // Convert complex numbers to magnitude (amplitude)
+  
+  float sum = 0.0;
+  // Iterate through the spectrum, skipping the DC component (vReal[0])
+  // and the first few bins that might contain noise.
+  // SAMPLES / 2 is the Nyquist frequency.
+  for (int i = 2; i < (SAMPLES / 2); i++) {
+    sum += vReal[i]; // Sum up the magnitudes
+  }
+  float average = sum / (SAMPLES / 2.0 - 2.0); // Calculate average magnitude (adjust divisor for skipped bins)
+  
+  return average; // Returns an average magnitude related to sound intensity
+}
+
+// Uploads sensor data to Firebase
+void uploadData() {
+  Serial.println("\n--- Uploading Data to Firebase ---");
+  // Update NTP time
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  
+  // Convert epoch time to human-readable format for paths
+  time_t rawTime = (time_t)epochTime;
+  struct tm * timeinfo;
+  timeinfo = localtime(&rawTime); // Converts to local time based on ESP8266's internal settings
+  
+  int year = timeinfo->tm_year + 1900;
+  int month = timeinfo->tm_mon + 1;
+  int day = timeinfo->tm_mday;
+  int hour = timeinfo->tm_hour;
+  
+  json.clear(); // Clear the JSON object for new data
+
+  // Add data to JSON based on sensor read success
+  json.add("timestamp", String(epochTime));
+
+  if (dhtReadSuccess) {
+    json.add("temperature", temperature);
+    json.add("humidity", humidity);
+  } else {
+    Serial.println("DHT data not valid for upload. Omitting from JSON.");
+    // You could add placeholder values if you want them in Firebase even if invalid:
+    // json.add("temperature", "N/A"); // Note: "N/A" is a string, which Firebase accepts
+    // json.add("humidity", "N/A");
+  }
+
+  if (mq135ReadSuccess) {
+    json.add("airQuality_raw", airQuality);
+    json.add("airQuality_ppm", correctedPPM);
+  } else {
+    Serial.println("MQ-135 data not valid for upload. Omitting from JSON.");
+  }
+  
+  if (soundReadSuccess) {
+    json.add("soundLevel", soundLevel);
+  } else {
+    Serial.println("Sound sensor data not valid for upload. Omitting from JSON.");
+  }
+  
+  // Define Firebase paths
+  String rawDataPath = "/environmental_data/" + String(epochTime); // Unique entry for each reading
+  String histPath = "/historical_data/" + 
+                    String(year) + "/" + 
+                    String(month) + "/" + 
+                    String(day) + "/" + 
+                    String(hour) + "/" + 
+                    String(epochTime % 3600); // Sub-path within the hour, 3600 seconds in an hour
+  String hourlyPath = "/aggregated_data/hourly/" + 
+                      String(year) + "/" + 
+                      String(month) + "/" + 
+                      String(day) + "/" + 
+                      String(hour); // Hourly aggregates
+
+  // Upload raw data
+  if (Firebase.setJSON(firebaseData, rawDataPath, json)) {
+    Serial.println("Raw data uploaded successfully");
+  } else {
+    Serial.println("Failed to upload raw data");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+  
+  // Upload historical data
+  if (Firebase.setJSON(firebaseData, histPath, json)) {
+    Serial.println("Historical data uploaded successfully");
+  } else {
+    Serial.println("Failed to upload historical data");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+  
+  // Update latest readings (overwrites previous "latest")
+  if (Firebase.setJSON(firebaseData, "/latest_readings", json)) {
+    Serial.println("Latest readings updated successfully");
+  } else {
+    Serial.println("Failed to update latest readings");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+  
+  // Update hourly aggregates
+  updateHourlyAggregates(hourlyPath);
+  Serial.println("--- Firebase Upload Complete ---");
+}
+
+// Updates hourly aggregated data in Firebase (averages, totals)
+void updateHourlyAggregates(String hourlyPath) {
+  FirebaseJson hourlyData; // Temporary JSON object for hourly aggregates
+  
+  // Try to retrieve existing hourly data
+  if (Firebase.getJSON(firebaseData, hourlyPath)) {
+    FirebaseJson &existingData = firebaseData.jsonObject(); // Get the existing JSON object
+    FirebaseJsonData jsonData; // Helper to extract data from JSON
+    
+    // Initialize totals with current readings or existing values if current read failed
+    int count = 0;
+    float tempTotal = 0.0;
+    float humTotal = 0.0;
+    float aqRawTotal = 0.0;
+    float aqPpmTotal = 0.0;
+    float soundTotal = 0.0;
+
+    // Retrieve existing aggregate data and add current readings if successful
+    existingData.get(jsonData, "count");
+    if (jsonData.success) count = jsonData.intValue + 1; else count = 1;
+
+    if (dhtReadSuccess) {
+      existingData.get(jsonData, "tempTotal");
+      if (jsonData.success) tempTotal = jsonData.floatValue + temperature; else tempTotal = temperature;
+
+      existingData.get(jsonData, "humTotal");
+      if (jsonData.success) humTotal = jsonData.floatValue + humidity; else humTotal = humidity;
+    } else {
+        // If DHT read failed, maintain old total from Firebase if it exists
+        existingData.get(jsonData, "tempTotal"); 
+        if (jsonData.success) tempTotal = jsonData.floatValue; 
+        
+        existingData.get(jsonData, "humTotal"); 
+        if (jsonData.success) humTotal = jsonData.floatValue;
+    }
+    
+    if (mq135ReadSuccess) {
+      existingData.get(jsonData, "aqRawTotal");
+      if (jsonData.success) aqRawTotal = jsonData.floatValue + airQuality; else aqRawTotal = airQuality;
+      
+      existingData.get(jsonData, "aqPpmTotal");
+      if (jsonData.success) aqPpmTotal = jsonData.floatValue + correctedPPM; else aqPpmTotal = correctedPPM;
+    } else {
+        existingData.get(jsonData, "aqRawTotal"); 
+        if (jsonData.success) aqRawTotal = jsonData.floatValue;
+        
+        existingData.get(jsonData, "aqPpmTotal"); 
+        if (jsonData.success) aqPpmTotal = jsonData.floatValue;
+    }
+
+    if (soundReadSuccess) {
+      existingData.get(jsonData, "soundTotal");
+      if (jsonData.success) soundTotal = jsonData.floatValue + soundLevel; else soundTotal = soundLevel;
+    } else {
+        existingData.get(jsonData, "soundTotal"); 
+        if (jsonData.success) soundTotal = jsonData.floatValue;
+    }
+
+    // Add updated totals to the hourly data JSON
+    hourlyData.add("count", count);
+    hourlyData.add("tempTotal", tempTotal);
+    hourlyData.add("humTotal", humTotal);
+    hourlyData.add("aqRawTotal", aqRawTotal);
+    hourlyData.add("aqPpmTotal", aqPpmTotal);
+    hourlyData.add("soundTotal", soundTotal);
+    
+    // Calculate and add averages
+    // Use current reading if 'count' is 0 (first valid reading) or sensor reading was not successful for this cycle
+    hourlyData.add("tempAvg", (count > 0 && dhtReadSuccess) ? (tempTotal / count) : (temperature)); 
+    hourlyData.add("humAvg", (count > 0 && dhtReadSuccess) ? (humTotal / count) : (humidity));
+    hourlyData.add("aqRawAvg", (count > 0 && mq135ReadSuccess) ? (aqRawTotal / count) : (airQuality));
+    hourlyData.add("aqPpmAvg", (count > 0 && mq135ReadSuccess) ? (aqPpmTotal / count) : (correctedPPM));
+    hourlyData.add("soundAvg", (count > 0 && soundReadSuccess) ? (soundTotal / count) : (soundLevel));
+
+  } else { // No existing data for this hour, create new entry
+    Serial.println("No existing hourly data. Creating new aggregate.");
+    hourlyData.add("count", 1); // First reading for this hour
+    
+    // Add current readings directly if successful, otherwise add 0.0
+    if (dhtReadSuccess) {
+      hourlyData.add("tempTotal", temperature);
+      hourlyData.add("humTotal", humidity);
+      hourlyData.add("tempAvg", temperature);
+      hourlyData.add("humAvg", humidity);
+    } else {
+      hourlyData.add("tempTotal", 0.0); hourlyData.add("humTotal", 0.0);
+      hourlyData.add("tempAvg", 0.0); hourlyData.add("humAvg", 0.0);
+    }
+    
+    if (mq135ReadSuccess) {
+      hourlyData.add("aqRawTotal", airQuality);
+      hourlyData.add("aqPpmTotal", correctedPPM);
+      hourlyData.add("aqRawAvg", airQuality);
+      hourlyData.add("aqPpmAvg", correctedPPM);
+    } else {
+      hourlyData.add("aqRawTotal", 0.0); hourlyData.add("aqPpmTotal", 0.0);
+      hourlyData.add("aqRawAvg", 0.0); hourlyData.add("aqPpmAvg", 0.0);
+    }
+
+    if (soundReadSuccess) {
+      hourlyData.add("soundTotal", soundLevel);
+      hourlyData.add("soundAvg", soundLevel);
+    } else {
+      hourlyData.add("soundTotal", 0.0); hourlyData.add("soundAvg", 0.0);
+    }
+  }
+  
+  // Upload the hourly aggregated data
+  if (Firebase.setJSON(firebaseData, hourlyPath, hourlyData)) {
+    Serial.println("Hourly aggregates updated successfully");
+  } else {
+    Serial.println("Failed to update hourly aggregates");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+}
